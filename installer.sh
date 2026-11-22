@@ -42,13 +42,18 @@ PARTITIONS_DONE=
 NETWORK_DONE=
 FILESYSTEMS_DONE=
 MIRROR_DONE=
+GUIDED_DISK=
+GUIDED_DISK_DETAILS=
+GUIDED_ENCRYPTION=
+GUIDED_SWAP_GIB=0
+GUIDED_STARTED=
+GUIDED_SWAP_PARTUUID=
+GUIDED_MAPPER_OPEN=
+GUIDED_LUKS_UUID=
 
 TARGETDIR=/mnt/target
 LOG=/dev/tty8
-CONF_FILE=/tmp/.void-installer.conf
-if [ ! -f $CONF_FILE ]; then
-    touch -f $CONF_FILE
-fi
+CONF_FILE=$(mktemp -t vinstall-conf-XXXXXXXX || exit 1)
 ANSWER=$(mktemp -t vinstall-XXXXXXXX || exit 1)
 TARGET_SERVICES=$(mktemp -t vinstall-sv-XXXXXXXX || exit 1)
 TARGET_FSTAB=$(mktemp -t vinstall-fstab-XXXXXXXX || exit 1)
@@ -95,7 +100,7 @@ YESNOSIZE="$INPUTSIZE"
 WIDGET_SIZE="10 70"
 
 DIALOG() {
-    rm -f $ANSWER
+    : >"$ANSWER"
     dialog --colors --keep-tite --no-shadow --no-mouse \
         --backtitle "${BOLD}${WHITE}Void Linux installation -- https://www.voidlinux.org (@@MKLIVE_VERSION@@)${RESET}" \
         --cancel-label "Back" --aspect 20 "$@" 2>$ANSWER
@@ -113,12 +118,13 @@ DIE() {
     rval=$1
     [ -z "$rval" ] && rval=0
     clear
-    rm -f $ANSWER $TARGET_FSTAB $TARGET_SERVICES
+    rm -f "$ANSWER" "$TARGET_FSTAB" "$TARGET_SERVICES"
     # reenable printk
     if [ -w /proc/sys/kernel/printk ]; then
         echo 4 >/proc/sys/kernel/printk
     fi
     umount_filesystems
+    rm -f "$CONF_FILE"
     exit $rval
 }
 
@@ -359,6 +365,268 @@ show_disks() {
         gbytes="$(($size * $sectorsize / 1024 / 1024 / 1024))"
         echo "size:${gbytes}GB;sector_size:$sectorsize"
     done
+}
+
+guided_supported() {
+    [ "$EFI_TARGET" = x86_64-efi ] && [ "$(xbps-uhelper arch)" = x86_64 ]
+}
+
+# Allow existing partitions, but keep mounted, swap, mapped, RAID and live
+# media devices out of the erase-disk menu. Recheck before changing the disk.
+guided_disk_details() {
+    local disk=$1 details devno bytes diskseq signatures mounted_btrfs
+    [ -b "$disk" ] || return 1
+    # A mounted multi-device Btrfs filesystem may report only one mount source.
+    mounted_btrfs=$(findmnt -rn -t btrfs -o UUID || :)
+    details=$(lsblk --json --bytes --paths --output \
+        NAME,TYPE,RO,SIZE,MOUNTPOINTS,MAJ:MIN,FSTYPE,UUID -- "$disk" |
+        jq -er --arg mounted_btrfs "$mounted_btrfs" '
+            ($mounted_btrfs | split("\n")) as $active_btrfs |
+            .blockdevices | select(length == 1) | .[0]
+            | select(.type == "disk" and .ro == false and .size >= 8589934592)
+            | select(all(recurse(.children[]?);
+                (.type == "disk" or .type == "part") and
+                (all(.mountpoints[]?; . == null or . == "")) and
+                (.fstype != "iso9660" and .fstype != "udf") and
+                (.fstype != "btrfs" or (.uuid as $uuid | $active_btrfs | index($uuid) == null))))
+            | "\(.["maj:min"]) \(.size)"
+        ') || return 1
+    read -r devno bytes <<<"$details"
+    diskseq=$(cat "/sys/dev/block/$devno/diskseq") || return 1
+    signatures=$(wipefs --no-act --noheadings --output TYPE -- "$disk") || return 1
+    if grep -Eq '(^|[[:space:]])(iso9660|udf)($|[[:space:]])' <<<"$signatures"; then
+        return 1
+    fi
+    printf '%s:%s %s\n' "$devno" "$diskseq" "$bytes"
+}
+
+menu_guided_storage() {
+    local disk details bytes encryption swap_gib=0 max_swap
+    local -a choices=()
+    while read -r disk; do
+        guided_disk_details "$disk" >/dev/null 2>&1 || continue
+        choices+=("$disk" "$(lsblk -dno SIZE,MODEL,TRAN -- "$disk")")
+    done < <(lsblk -dnpo NAME)
+    if [ "${#choices[@]}" -eq 0 ]; then
+        DIALOG --msgbox "No eligible disk. Guided needs a writable disk of at least 8 GiB with nothing mounted or active on it." ${MSGBOXSIZE}
+        return 1
+    fi
+    DIALOG --title " Guided whole-disk installation " --menu \
+        "Select the disk to erase. All existing partitions on it will be replaced at installation." \
+        ${MENUSIZE} "${choices[@]}" || return 1
+    disk=$(cat "$ANSWER")
+    details=$(guided_disk_details "$disk" 2>>"$LOG") || return 1
+    bytes=${details##* }
+
+    DIALOG --title " Disk encryption " --menu \
+        "Encryption protects Btrfs and swap. The EFI partition and /boot are unencrypted." \
+        ${MENUSIZE} "LUKS2" "Unlock with a passphrase at boot" "None" "Install without encryption" ||
+        return 1
+    encryption=$(cat "$ANSWER")
+
+    max_swap=$((bytes / (1024 * 1024 * 1024) - 8))
+    if (( max_swap > 0 )); then
+        DIALOG --title " Swap partition " --menu \
+            "A swap partition is optional. Hibernation is not configured." ${MENUSIZE} \
+            "None" "Install without swap" "Partition" "Choose a size in GiB" || return 1
+        if [ "$(cat "$ANSWER")" = Partition ]; then
+            local default_swap=4
+            (( max_swap >= default_swap )) || default_swap=$max_swap
+            while true; do
+                DIALOG --inputbox "Swap size in GiB (1 to $max_swap):" \
+                    ${INPUTSIZE} "$default_swap" || return 1
+                swap_gib=$(cat "$ANSWER")
+                if [[ "$swap_gib" =~ ^[1-9][0-9]{0,8}$ ]] && (( swap_gib <= max_swap )); then
+                    break
+                fi
+                DIALOG --msgbox "Enter a whole number between 1 and $max_swap." ${MSGBOXSIZE}
+            done
+        fi
+    fi
+
+    GUIDED_DISK=$disk
+    GUIDED_DISK_DETAILS=$details
+    GUIDED_ENCRYPTION=$encryption
+    GUIDED_SWAP_GIB=$swap_gib
+}
+
+guided_error() {
+    DIALOG --msgbox "$1
+See $LOG for details." ${MSGBOXSIZE}
+    DIE 1
+}
+
+guided_partition_table() {
+    printf '%s\n' 'label: gpt' \
+        'size=512MiB, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B' \
+        'size=2GiB, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+    if (( GUIDED_SWAP_GIB > 0 )); then
+        if [ "$GUIDED_ENCRYPTION" = LUKS2 ]; then
+            printf 'size=%sGiB, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\n' "$GUIDED_SWAP_GIB"
+        else
+            printf 'size=%sGiB, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F\n' "$GUIDED_SWAP_GIB"
+        fi
+    fi
+    if [ "$GUIDED_ENCRYPTION" = LUKS2 ]; then
+        printf '%s\n' 'type=CA7D7CCB-63ED-4C53-861C-1742536059CC'
+    else
+        printf '%s\n' 'type=0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+    fi
+}
+
+guided_filesystems() {
+    local disk=$GUIDED_DISK details efi boot swap root root_device device number third fourth
+    local passphrase repeated root_uuid boot_uuid efi_uuid swap_uuid
+    local mapper=/dev/mapper/void-root
+
+    if [ "$GUIDED_ENCRYPTION" = LUKS2 ]; then
+        # Route the result through a pipe and draw dialog directly on the terminal.
+        passphrase=$(DIALOG --output-fd 3 --passwordbox \
+            "Enter the passphrase for the encrypted system:" ${INPUTSIZE} \
+            3>&1 >/dev/tty </dev/tty) || return 1
+        repeated=$(DIALOG --output-fd 3 --passwordbox \
+            "Re-enter the encryption passphrase:" ${INPUTSIZE} \
+            3>&1 >/dev/tty </dev/tty) || return 1
+        if [ -z "$passphrase" ] || [ "$passphrase" != "$repeated" ]; then
+            DIALOG --msgbox "Enter the same non-empty passphrase twice." ${MSGBOXSIZE}
+            return 1
+        fi
+        unset repeated
+        if [ -e "$mapper" ] || cryptsetup status void-root >/dev/null 2>&1; then
+            guided_error "The void-root mapping is already in use."
+        fi
+    fi
+    if mountpoint -q "$TARGETDIR"; then
+        guided_error "The installer mount point is already in use."
+    fi
+    if ! details=$(guided_disk_details "$disk" 2>>"$LOG") ||
+        [ "$details" != "$GUIDED_DISK_DETAILS" ]; then
+        guided_error "The selected disk changed or is no longer eligible."
+    fi
+
+    GUIDED_STARTED=1
+    GUIDED_LUKS_UUID=
+    GUIDED_SWAP_PARTUUID=
+    TITLE="Check $LOG for details ..."
+    INFOBOX "Creating the Btrfs layout on $disk ..." 8 65
+    guided_partition_table |
+        sfdisk --lock=yes --wipe always --wipe-partitions always -- "$disk" >>"$LOG" 2>&1 ||
+        guided_error "Failed to replace the partition table on $disk."
+    udevadm settle >>"$LOG" 2>&1 || guided_error "Failed to settle partition devices."
+    while read -r device number; do
+        case "$number" in
+            1) efi=$device;;
+            2) boot=$device;;
+            3) third=$device;;
+            4) fourth=$device;;
+        esac
+    done < <(lsblk -nrpo NAME,PARTN -- "$disk")
+    root=$third
+    if (( GUIDED_SWAP_GIB > 0 )); then
+        swap=$third
+        root=$fourth
+    fi
+    if ! [ -b "$efi" ] || ! [ -b "$boot" ] || ! [ -b "$root" ] ||
+        { (( GUIDED_SWAP_GIB > 0 )) && ! [ -b "$swap" ]; }; then
+        guided_error "Could not find all new partitions on $disk."
+    fi
+
+    mkfs.vfat -F32 "$efi" >>"$LOG" 2>&1 &&
+        mkfs.ext4 -F "$boot" >>"$LOG" 2>&1 ||
+        guided_error "Failed to format the EFI or boot partition."
+
+    root_device=$root
+    if [ "$GUIDED_ENCRYPTION" = LUKS2 ]; then
+        printf '%s' "$passphrase" |
+            cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id \
+                --key-file - "$root" >>"$LOG" 2>&1 ||
+            guided_error "Failed to format encrypted root."
+        printf '%s' "$passphrase" |
+            cryptsetup open --key-file - "$root" void-root >>"$LOG" 2>&1 ||
+            guided_error "Failed to unlock encrypted root."
+        GUIDED_MAPPER_OPEN=1
+        unset passphrase
+        GUIDED_LUKS_UUID=$(cryptsetup luksUUID "$root" 2>>"$LOG") ||
+            guided_error "Failed to read the LUKS identifier."
+        root_device=$mapper
+    fi
+
+    mkfs.btrfs -f "$root_device" >>"$LOG" 2>&1 &&
+        mkdir -p "$TARGETDIR" &&
+        mount -t btrfs -o subvolid=5 "$root_device" "$TARGETDIR" >>"$LOG" 2>&1 &&
+        btrfs subvolume create "$TARGETDIR/@" "$TARGETDIR/@home" \
+            "$TARGETDIR/@snapshots" >>"$LOG" 2>&1 &&
+        umount "$TARGETDIR" >>"$LOG" 2>&1 &&
+        mount -t btrfs -o subvol=@ "$root_device" "$TARGETDIR" >>"$LOG" 2>&1 &&
+        mkdir -p "$TARGETDIR/boot" "$TARGETDIR/home" "$TARGETDIR/.snapshots" &&
+        mount -t ext4 "$boot" "$TARGETDIR/boot" >>"$LOG" 2>&1 &&
+        mkdir -p "$TARGETDIR/boot/efi" &&
+        mount -t vfat "$efi" "$TARGETDIR/boot/efi" >>"$LOG" 2>&1 &&
+        mount -t btrfs -o subvol=@home "$root_device" "$TARGETDIR/home" >>"$LOG" 2>&1 &&
+        mount -t btrfs -o subvol=@snapshots "$root_device" "$TARGETDIR/.snapshots" >>"$LOG" 2>&1 &&
+        chmod 0750 "$TARGETDIR/.snapshots" ||
+        guided_error "Failed to create or mount the new filesystems."
+
+    root_uuid=$(blkid -s UUID -o value "$root_device") &&
+        boot_uuid=$(blkid -s UUID -o value "$boot") &&
+        efi_uuid=$(blkid -s UUID -o value "$efi") ||
+        guided_error "Failed to read the new filesystem identifiers."
+    cat >"$TARGET_FSTAB" <<EOF ||
+UUID=$root_uuid / btrfs defaults,subvol=@ 0 0
+UUID=$boot_uuid /boot ext4 defaults 0 2
+UUID=$efi_uuid /boot/efi vfat defaults,umask=0077 0 2
+UUID=$root_uuid /home btrfs defaults,subvol=@home 0 0
+UUID=$root_uuid /.snapshots btrfs defaults,subvol=@snapshots 0 0
+EOF
+        guided_error "Failed to write the filesystem table."
+
+    if (( GUIDED_SWAP_GIB > 0 )); then
+        if [ "$GUIDED_ENCRYPTION" = LUKS2 ]; then
+            # runit will open plain dm-crypt with a new random key and run mkswap at boot.
+            GUIDED_SWAP_PARTUUID=$(blkid -s PARTUUID -o value "$swap") ||
+                guided_error "Failed to read the swap partition identifier."
+            printf '/dev/mapper/void-swap none swap defaults 0 0\n' >>"$TARGET_FSTAB" ||
+                guided_error "Failed to write encrypted swap settings."
+        else
+            mkswap "$swap" >>"$LOG" 2>&1 &&
+                swap_uuid=$(blkid -s UUID -o value "$swap") &&
+                printf 'UUID=%s none swap defaults 0 0\n' "$swap_uuid" >>"$TARGET_FSTAB" ||
+                guided_error "Failed to create the swap partition."
+        fi
+    fi
+}
+
+configure_guided_boot() {
+    local keymap
+    local -a dracut_args=(--force --regenerate-all --no-hostonly --add-drivers ahci --add btrfs)
+    if [ -n "$GUIDED_LUKS_UUID" ]; then
+        keymap=$(get_option KEYMAP)
+        if [ -z "$keymap" ] && [ -f /etc/vconsole.conf ]; then
+            keymap=$(sed -n 's/^KEYMAP=//p' /etc/vconsole.conf)
+        fi
+        keymap=${keymap:-us}
+        [[ "$keymap" =~ ^[[:alnum:]_.+-]+$ ]] || guided_error "Invalid boot keymap."
+
+        printf 'void-root UUID=%s none luks\n' "$GUIDED_LUKS_UUID" >"$TARGETDIR/etc/crypttab" &&
+            mkdir -p "$TARGETDIR/etc/dracut.conf.d" &&
+            printf '%s\n' 'add_dracutmodules+=" crypt btrfs i18n "' \
+                'install_items+=" /etc/crypttab "' \
+                >"$TARGETDIR/etc/dracut.conf.d/90-void-encrypted-root.conf" &&
+            printf 'KEYMAP=%s\n' "$keymap" >"$TARGETDIR/etc/vconsole.conf" &&
+            printf '\nGRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX rd.luks.uuid=%s rd.vconsole.keymap=%s"\n' \
+                "$GUIDED_LUKS_UUID" "$keymap" >>"$TARGETDIR/etc/default/grub" ||
+            guided_error "Failed to write encrypted boot settings."
+
+        if [ -n "$GUIDED_SWAP_PARTUUID" ]; then
+            printf 'void-swap /dev/disk/by-partuuid/%s /dev/urandom swap,cipher=aes-xts-plain64,size=512\n' \
+                "$GUIDED_SWAP_PARTUUID" >>"$TARGETDIR/etc/crypttab" ||
+                guided_error "Failed to configure encrypted swap."
+        fi
+    fi
+
+    INFOBOX "Building initramfs for the installed system ..." 4 65
+    chroot "$TARGETDIR" dracut "${dracut_args[@]}" >>"$LOG" 2>&1 ||
+        guided_error "Failed to build the installed system's initramfs."
 }
 
 get_partfs() {
@@ -816,6 +1084,7 @@ menu_bootloader() {
 
 set_bootloader() {
     local dev=$(get_option BOOTLOADER) grub_args=
+    [ -n "$GUIDED_DISK" ] && dev=$GUIDED_DISK
 
     if [ "$dev" = "none" ]; then return; fi
 
@@ -1178,11 +1447,28 @@ mount_filesystems() {
     for f in sys proc dev; do
         [ ! -d $TARGETDIR/$f ] && mkdir $TARGETDIR/$f
         echo "Mounting $TARGETDIR/$f..." >$LOG
-        mount --rbind /$f $TARGETDIR/$f >$LOG 2>&1
+        if [ -n "$GUIDED_DISK" ]; then
+            mount --rbind "/$f" "$TARGETDIR/$f" --make-rslave >>"$LOG" 2>&1 ||
+                guided_error "Failed to bind-mount /$f."
+        else
+            mount --rbind /$f $TARGETDIR/$f >$LOG 2>&1
+        fi
     done
 }
 
 umount_filesystems() {
+    if [ -n "$GUIDED_STARTED" ]; then
+        if mountpoint -q "$TARGETDIR"; then
+            umount -R "$TARGETDIR" >>"$LOG" 2>&1 || return 1
+        fi
+        if [ -n "$GUIDED_MAPPER_OPEN" ]; then
+            cryptsetup close void-root >>"$LOG" 2>&1 || return 1
+            GUIDED_MAPPER_OPEN=
+        fi
+        GUIDED_STARTED=
+        return 0
+    fi
+    [ -n "$GUIDED_DISK" ] && return 0
     local mnts="$(grep -E '^MOUNTPOINT .* swap .*$' $CONF_FILE | sort -r -k 5)"
     set -- ${mnts}
     while [ $# -ne 0 ]; do
@@ -1216,6 +1502,23 @@ log_and_count() {
 copy_rootfs() {
     local tar_in="--create --one-file-system --xattrs"
     TITLE="Check $LOG for details ..."
+    if [ -n "$GUIDED_DISK" ]; then
+        INFOBOX "Copying the live system to the target disk ..." 4 65
+        local -a copy_status
+        {
+            tar $tar_in -C / --exclude=./dev --exclude=./proc --exclude=./sys \
+                --exclude=./run --exclude=./mnt/target -f - . |
+                tar --extract --xattrs --xattrs-include='*' --preserve-permissions -f - -C "$TARGETDIR"
+            copy_status=("${PIPESTATUS[@]}")
+        } >>"$LOG" 2>&1
+        # Exit 1 on creation means a file changed in the running live system.
+        if [ "${copy_status[0]}" -gt 1 ] || [ "${copy_status[1]}" -ne 0 ]; then
+            guided_error "Failed to copy the live system."
+        fi
+        mkdir -p "$TARGETDIR"/{dev,proc,sys,run} ||
+            guided_error "Failed to create target mount points."
+        return
+    fi
     INFOBOX "Counting files, please be patient ..." 4 60
     copy_total=$(tar ${tar_in} -v -f /dev/null / 2>/dev/null | wc -l)
     export copy_total copy_count=0 copy_progress=
@@ -1231,10 +1534,67 @@ copy_rootfs() {
     unset copy_total copy_count copy_percent
 }
 
-install_packages() {
-    local _grub= _syspkg=
+guided_desktop_profile() {
+    GUIDED_DESKTOP_PACKAGES=()
+    GUIDED_DISPLAY_MANAGER=
+    case "$1" in
+        Base|"") return 0;;
+        Plasma)
+            GUIDED_DESKTOP_PACKAGES=(kde5 konsole dolphin)
+            GUIDED_DISPLAY_MANAGER=sddm
+            ;;
+        Xfce)
+            GUIDED_DESKTOP_PACKAGES=(xfce4 xfce4-terminal lightdm-gtk-greeter network-manager-applet)
+            GUIDED_DISPLAY_MANAGER=lightdm
+            ;;
+        GNOME)
+            GUIDED_DESKTOP_PACKAGES=(gnome)
+            GUIDED_DISPLAY_MANAGER=gdm
+            ;;
+        LXQt)
+            GUIDED_DESKTOP_PACKAGES=(lxqt qterminal network-manager-applet)
+            GUIDED_DISPLAY_MANAGER=sddm
+            ;;
+        *) return 1;;
+    esac
+    GUIDED_DESKTOP_PACKAGES+=(
+        "$GUIDED_DISPLAY_MANAGER" dbus NetworkManager xorg-minimal xorg-input-drivers
+        xorg-video-drivers xauth dejavu-fonts-ttf mesa-dri pipewire wireplumber alsa-pipewire
+    )
+}
 
-    if [ "$(get_option BOOTLOADER)" != none ]; then
+guided_check_repository() (
+    local dir
+    dir=$(mktemp -d) || return 1
+    trap 'rm -f "$dir/otime"; rmdir "$dir"' EXIT
+    cd "$dir" && xbps-uhelper fetch https://repo-default.voidlinux.org/current/otime >>"$LOG" 2>&1
+)
+
+configure_guided_network_profile() {
+    if [ -z "$GUIDED_DISPLAY_MANAGER" ]; then
+        [ -n "$(get_option NETWORK)" ] || enable_service dhcpcd
+        return
+    fi
+
+    enable_service dbus
+    enable_service "$GUIDED_DISPLAY_MANAGER"
+    if [ -z "$(get_option NETWORK)" ]; then
+        disable_service dhcpcd
+        disable_service wpa_supplicant
+        enable_service NetworkManager
+    fi
+    mkdir -p "$TARGETDIR/etc/xdg/autostart" "$TARGETDIR/etc/pipewire/pipewire.conf.d" &&
+        ln -sf /usr/share/applications/pipewire.desktop "$TARGETDIR/etc/xdg/autostart/" &&
+        ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf \
+            "$TARGETDIR/etc/pipewire/pipewire.conf.d/" ||
+        guided_error "Failed to configure desktop audio."
+}
+
+install_packages() {
+    local _grub= _arch
+    local -a packages=(base-system) status
+
+    if [ -n "$GUIDED_DISK" ] || [ "$(get_option BOOTLOADER)" != none ]; then
         if [ -n "$EFI_SYSTEM" ]; then
             if [ $EFI_FW_BITS -eq 32 ]; then
                 _grub="grub-i386-efi"
@@ -1246,7 +1606,12 @@ install_packages() {
         fi
     fi
 
-    _syspkg="base-system"
+    [ -z "$_grub" ] || packages+=("$_grub")
+    if [ -n "$GUIDED_DISK" ]; then
+        packages+=(btrfs-progs)
+        [ "$GUIDED_ENCRYPTION" != LUKS2 ] || packages+=(cryptsetup)
+        packages+=("${GUIDED_DESKTOP_PACKAGES[@]}")
+    fi
 
     mkdir -p $TARGETDIR/var/db/xbps/keys $TARGETDIR/usr/share
     cp -a /usr/share/xbps.d $TARGETDIR/usr/share/
@@ -1259,17 +1624,20 @@ install_packages() {
 
     _arch=$(xbps-uhelper arch)
 
-    stdbuf -oL env XBPS_ARCH=${_arch} \
-        xbps-install  -r $TARGETDIR -SyU ${_syspkg} ${_grub} 2>&1 | \
-        DIALOG --title "Installing base system packages..." \
-        --programbox 24 80
-    if [ $? -ne 0 ]; then
+    stdbuf -oL env XBPS_ARCH="$_arch" \
+        xbps-install -r "$TARGETDIR" -SyU "${packages[@]}" 2>&1 | tee -a "$LOG" | \
+        DIALOG --title "Installing system packages..." --programbox 24 80
+    status=("${PIPESTATUS[@]}")
+    if [ "${status[0]}" -ne 0 ] || [ "${status[2]}" -ne 0 ]; then
+        DIALOG --msgbox "Package installation failed. See $LOG for details." ${MSGBOXSIZE}
         DIE 1
     fi
-    xbps-reconfigure -r $TARGETDIR -f base-files >/dev/null 2>&1
-    stdbuf -oL chroot $TARGETDIR xbps-reconfigure -a 2>&1 | \
-        DIALOG --title "Configuring base system packages..." --programbox 24 80
-    if [ $? -ne 0 ]; then
+    xbps-reconfigure -r "$TARGETDIR" -f base-files >>"$LOG" 2>&1 || DIE 1
+    stdbuf -oL chroot "$TARGETDIR" xbps-reconfigure -a 2>&1 | tee -a "$LOG" | \
+        DIALOG --title "Configuring system packages..." --programbox 24 80
+    status=("${PIPESTATUS[@]}")
+    if [ "${status[0]}" -ne 0 ] || [ "${status[2]}" -ne 0 ]; then
+        DIALOG --msgbox "Package configuration failed. See $LOG for details." ${MSGBOXSIZE}
         DIE 1
     fi
 }
@@ -1315,6 +1683,8 @@ disable_service() {
 }
 
 menu_install() {
+    local source desktop swap_summary encryption_summary
+    source=$(get_option SOURCE)
     ROOTPASSWORD_DONE="$(get_option ROOTPASSWORD)"
     BOOTLOADER_DONE="$(get_option BOOTLOADER)"
 
@@ -1322,7 +1692,10 @@ menu_install() {
         DIALOG --msgbox "${BOLD}The root password has not been configured, \
 please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
         return 1
-    elif [ -z "$BOOTLOADER_DONE" ]; then
+    elif guided_supported && [ -z "$GUIDED_DISK" ]; then
+        DIALOG --msgbox "Select a target and storage options in Guided first." ${MSGBOXSIZE}
+        return 1
+    elif [ -z "$GUIDED_DISK" ] && [ -z "$BOOTLOADER_DONE" ]; then
         DIALOG --msgbox "${BOLD}The disk to install the bootloader has not been \
 configured, please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
         return 1
@@ -1330,9 +1703,34 @@ configured, please do so before starting the installation.${RESET}" ${MSGBOXSIZE
 
     # Validate filesystems after making sure bootloader is done,
     # so that specific checks can be made based on the selection
-    validate_filesystems || return 1
+    if [ -n "$GUIDED_DISK" ]; then
+        if [ "$source" = net ]; then
+            desktop=$(get_option DESKTOP)
+            if ! guided_desktop_profile "${desktop:-Base}"; then
+                DIALOG --msgbox "Choose a desktop or Base under Source." ${MSGBOXSIZE}
+                return 1
+            fi
+            if ! guided_check_repository; then
+                DIALOG --msgbox "Cannot reach Void's repository. Connect from the live system or choose Local under Source." ${MSGBOXSIZE}
+                return 1
+            fi
+            desktop="${desktop:-Base} (download)"
+        else
+            desktop="Live ISO (offline)"
+        fi
+        encryption_summary="Unencrypted Btrfs"
+        [ "$GUIDED_ENCRYPTION" != LUKS2 ] || encryption_summary="LUKS2-encrypted Btrfs"
+        swap_summary="No swap"
+        if (( GUIDED_SWAP_GIB > 0 )); then
+            swap_summary="$GUIDED_SWAP_GIB GiB swap partition"
+            [ "$GUIDED_ENCRYPTION" != LUKS2 ] || swap_summary="$swap_summary (encrypted)"
+        fi
+        TARGETFS="ERASE $GUIDED_DISK ($(lsblk -dno SIZE,MODEL,TRAN -- "$GUIDED_DISK"))\nReplace the entire partition table and all existing partitions.\n$encryption_summary for /, /home and /.snapshots\n$swap_summary\nSystem: $desktop"
+    else
+        validate_filesystems || return 1
+    fi
 
-    if [ -z "$FILESYSTEMS_DONE" ]; then
+    if [ -z "$GUIDED_DISK" ] && [ -z "$FILESYSTEMS_DONE" ]; then
         DIALOG --msgbox "${BOLD}Required filesystems were not configured, \
 please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
         return 1
@@ -1348,7 +1746,9 @@ with the root user in your new system.${RESET}\n\n
 ${BOLD}Do you want to continue?${RESET}" 10 60 || return
     fi
 
-    DIALOG --yesno "${BOLD}The following operations will be executed:${RESET}\n\n
+    local -a confirmation=()
+    [ -z "$GUIDED_DISK" ] || confirmation=(--defaultno)
+    DIALOG "${confirmation[@]}" --yesno "${BOLD}The following operations will be executed:${RESET}\n\n
 ${BOLD}${TARGETFS}${RESET}\n
 ${BOLD}${RED}WARNING: data on partitions will be COMPLETELY DESTROYED for new \
 filesystems.${RESET}\n\n
@@ -1356,7 +1756,11 @@ ${BOLD}Do you want to continue?${RESET}" 20 80 || return
     unset TARGETFS
 
     # Create and mount filesystems
-    create_filesystems
+    if [ -n "$GUIDED_DISK" ]; then
+        guided_filesystems || return 1
+    else
+        create_filesystems
+    fi
 
     # check if there are any files in the root partition, ignoring lost+found
     if find "$TARGETDIR" -xdev -not -name 'lost+found' -not -type d | read; then
@@ -1373,6 +1777,7 @@ Root partition not empty! Aborting..." ${MSGBOXSIZE}
         rm -f $TARGETDIR/etc/motd
         rm -f $TARGETDIR/etc/issue
         rm -f $TARGETDIR/usr/sbin/void-installer
+        [ -z "$GUIDED_DISK" ] || rm -f "$TARGETDIR/usr/bin/void-installer"
         # Remove modified sddm.conf to let sddm use the defaults.
         rm -f $TARGETDIR/etc/sddm.conf
         # Remove live user.
@@ -1381,11 +1786,13 @@ Root partition not empty! Aborting..." ${MSGBOXSIZE}
         rm -f $TARGETDIR/etc/sudoers.d/99-void-live
         sed -i "s,GETTY_ARGS=\"--noclear -a $USERNAME\",GETTY_ARGS=\"--noclear\",g" $TARGETDIR/etc/sv/agetty-tty1/conf
         TITLE="Check $LOG for details ..."
-        INFOBOX "Rebuilding initramfs for target ..." 4 60
-        echo "Rebuilding initramfs for target ..." >$LOG
         # mount required fs
         mount_filesystems
-        chroot $TARGETDIR dracut --no-hostonly --add-drivers "ahci" --force >>$LOG 2>&1
+        if [ -z "$GUIDED_DISK" ]; then
+            INFOBOX "Rebuilding initramfs for target ..." 4 60
+            echo "Rebuilding initramfs for target ..." >$LOG
+            chroot $TARGETDIR dracut --no-hostonly --add-drivers "ahci" --force >>$LOG 2>&1
+        fi
         INFOBOX "Removing temporary packages from target ..." 4 60
         echo "Removing temporary packages from target ..." >$LOG
         TO_REMOVE="dialog xtools-minimal xmirror"
@@ -1396,14 +1803,16 @@ Root partition not empty! Aborting..." ${MSGBOXSIZE}
         if ! [ -e "/var/service/brltty" ]; then
             TO_REMOVE+=" brltty"
         fi
-        if [ "$(get_option BOOTLOADER)" = none ]; then
+        if [ -z "$GUIDED_DISK" ] && [ "$(get_option BOOTLOADER)" = none ]; then
             TO_REMOVE+=" grub-x86_64-efi grub-i386-efi grub"
         fi
         # uninstall separately to minimise errors
         for pkg in $TO_REMOVE; do
             xbps-remove -r $TARGETDIR -Ry "$pkg" >>$LOG 2>&1
         done
-        rmdir $TARGETDIR/mnt/target
+        if [ -d "$TARGETDIR/mnt/target" ]; then
+            rmdir "$TARGETDIR/mnt/target"
+        fi
     else
         # mount required fs
         mount_filesystems
@@ -1481,6 +1890,14 @@ Root partition not empty! Aborting..." ${MSGBOXSIZE}
             -e 's|#\(GRUB_TERMINAL_OUTPUT\).*|\1=console|'
     fi
 
+    if [ -n "$GUIDED_DISK" ]; then
+        configure_guided_boot
+    fi
+
+    if [ -n "$GUIDED_DISK" ] && [ "$source" = net ]; then
+        configure_guided_network_profile
+    fi
+
     # install bootloader.
     set_bootloader
 
@@ -1490,7 +1907,9 @@ Root partition not empty! Aborting..." ${MSGBOXSIZE}
     sync && sync && sync
 
     # unmount all filesystems.
-    umount_filesystems
+    if ! umount_filesystems && [ -n "$GUIDED_DISK" ]; then
+        guided_error "Failed to unmount the target or close the encrypted mapping."
+    fi
 
     # installed successfully.
     DIALOG --yesno "${BOLD}Void Linux has been installed successfully!${RESET}\n
@@ -1503,7 +1922,29 @@ Do you want to reboot the system?" ${YESNOSIZE}
 }
 
 menu_source() {
-    local src=
+    local src= choice
+
+    if guided_supported; then
+        DIALOG --title " Select installation profile " --menu \
+            "Local copies the live system. The other choices download from Void's repositories." \
+            ${MENUSIZE} \
+            "Local" "Live ISO desktop, offline" \
+            "Base" "Console only" \
+            "Plasma" "KDE Plasma desktop" \
+            "Xfce" "Xfce desktop" \
+            "GNOME" "GNOME desktop" \
+            "LXQt" "Lightweight Qt desktop" || return 1
+        choice=$(cat "$ANSWER")
+        if [ "$choice" = Local ]; then
+            set_option DESKTOP Local
+            set_option SOURCE local
+        else
+            set_option DESKTOP "$choice"
+            set_option SOURCE net
+        fi
+        SOURCE_DONE=1
+        return
+    fi
 
     DIALOG --title " Select installation source " \
         --menu "$MENULABEL" 8 70 0 \
@@ -1528,12 +1969,22 @@ menu_mirror() {
 }
 
 menu() {
-    local AFTER_HOSTNAME
+    local AFTER_HOSTNAME arch after_useraccount=BootLoader
+    local -a storage_entries=(
+        "BootLoader" "Set disk to install bootloader"
+        "Partition" "Partition disk(s)"
+        "Filesystems" "Configure filesystems and mount points"
+    )
+    arch=$(xbps-uhelper arch)
+    if guided_supported; then
+        storage_entries=("Guided" "Set disk, encryption, and swap")
+        after_useraccount=Guided
+    fi
     if [ -z "$DEFITEM" ]; then
         DEFITEM="Keyboard"
     fi
 
-    if xbps-uhelper arch | grep -qe '-musl$'; then
+    if [[ "$arch" = *-musl ]]; then
         AFTER_HOSTNAME="Timezone"
         DIALOG --default-item $DEFITEM \
             --extra-button --extra-label "Settings" \
@@ -1567,20 +2018,17 @@ menu() {
             "Timezone" "Set system time zone" \
             "RootPassword" "Set system root password" \
             "UserAccount" "Set primary user name and password" \
-            "BootLoader" "Set disk to install bootloader" \
-            "Partition" "Partition disk(s)" \
-            "Filesystems" "Configure filesystems and mount points" \
+            "${storage_entries[@]}" \
             "Install" "Start installation with saved settings" \
             "Exit" "Exit installation"
     fi
 
     if [ $? -eq 3 ]; then
-        # Show settings
-        cp $CONF_FILE /tmp/conf_hidden.$$;
-        sed -i "s/^ROOTPASSWORD .*/ROOTPASSWORD <-hidden->/" /tmp/conf_hidden.$$
-        sed -i "s/^USERPASSWORD .*/USERPASSWORD <-hidden->/" /tmp/conf_hidden.$$
-        DIALOG --title "Saved settings for installation" --textbox /tmp/conf_hidden.$$ 14 60
-        rm /tmp/conf_hidden.$$
+        local settings
+        settings=$(mktemp -t vinstall-settings-XXXXXXXX) || return 1
+        sed -E 's/^(ROOTPASSWORD|USERPASSWORD) .*/\1 <-hidden->/' "$CONF_FILE" >"$settings"
+        DIALOG --title "Saved settings for installation" --textbox "$settings" 14 60
+        rm -f "$settings"
         return
     fi
 
@@ -1594,10 +2042,11 @@ menu() {
         "Timezone") menu_timezone && [ -n "$TIMEZONE_DONE" ] && DEFITEM="RootPassword";;
         "RootPassword") menu_rootpassword && [ -n "$ROOTPASSWORD_DONE" ] && DEFITEM="UserAccount";;
         "UserAccount") menu_useraccount && [ -n "$USERLOGIN_DONE" ] && [ -n "$USERPASSWORD_DONE" ] \
-               && DEFITEM="BootLoader";;
+               && DEFITEM="$after_useraccount";;
         "BootLoader") menu_bootloader && [ -n "$BOOTLOADER_DONE" ] && DEFITEM="Partition";;
-        "Partition") menu_partitions && [ -n "$PARTITIONS_DONE" ] && DEFITEM="Filesystems";;
-        "Filesystems") menu_filesystems && [ -n "$FILESYSTEMS_DONE" ] && DEFITEM="Install";;
+        "Guided") menu_guided_storage && DEFITEM="Install";;
+        "Partition") GUIDED_DISK=; menu_partitions && [ -n "$PARTITIONS_DONE" ] && DEFITEM="Filesystems";;
+        "Filesystems") GUIDED_DISK=; menu_filesystems && [ -n "$FILESYSTEMS_DONE" ] && DEFITEM="Install";;
         "Install") menu_install;;
         "Exit") DIE;;
         *) DIALOG --yesno "Abort Installation?" ${YESNOSIZE} && DIE

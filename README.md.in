@@ -1,4 +1,62 @@
-# The Void Linux live image/rootfs generator and installer
+# Void Guided Installer
+
+Install Void Linux on Btrfs with a guided whole-disk setup. This unofficial
+installer sets up UEFI GRUB and mounts **@** at **/**, **@home** at **/home**,
+and **@snapshots** at **/.snapshots**. You choose whether to encrypt the system
+with LUKS2 and whether to create a swap partition. For other filesystem layouts,
+use the [official Void Linux installer](https://voidlinux.org/download/).
+
+This project builds on Void's [void-mklive](https://github.com/void-linux/void-mklive)
+and installs packages from Void's repositories.
+
+## Install
+
+1. Boot an **x86-64 glibc** live image from USB in **UEFI** mode. The preview was
+   tested with Secure Boot off.
+2. Run **sudo void-installer** in a terminal. Set your root password and create a
+   user account.
+3. Under **Source**, choose **Local** to copy the live image's desktop offline,
+   or choose **Base**, **Plasma**, **Xfce**, **GNOME**, or **LXQt** to install from
+   Void's repositories over the network. The KDE live image installs Plasma
+   offline. Use the live desktop's network controls to connect before selecting
+   a network profile.
+4. Under **Guided**, choose the target disk, whether to use encryption, and
+   whether to create swap. Choose **Install**, then verify the disk model and
+   capacity in the confirmation before proceeding.
+5. Remove the USB after installation and boot from the installed disk. If you
+   chose encryption, enter the disk passphrase when prompted.
+
+**Guided replaces every partition on the selected disk.** It can reuse a disk
+that already contains an installation. Back up data you want to keep before you
+confirm the erase. The EFI partition and a separate **/boot** remain
+unencrypted. With LUKS2 enabled, optional swap is encrypted with a new key at each
+boot. The installer creates **/.snapshots** for snapshots you manage yourself.
+Hibernation is outside this preview.
+
+## Build the Plasma live image
+
+Run the following from this checkout on Void Linux. The image builder needs root
+access to create and mount filesystems for the ISO.
+
+~~~sh
+sudo ./mkiso.sh -b kde
+~~~
+
+The build writes a **void-live-x86_64-…-kde.iso** in the checkout. Write that ISO
+as an image to the USB drive.
+
+## Preview testing
+
+| Scenario | Observed result |
+| --- | --- |
+| Virtual machine, unencrypted Base with swap | Replaced an existing ext4 layout, cold-booted, mounted all three Btrfs subvolumes, and activated swap |
+| Virtual machine, offline Plasma with LUKS2 and swap | Replaced an existing ext4 layout, cold-booted through one unlock prompt, mounted all three Btrfs subvolumes, and activated encrypted swap |
+| Laptop, GNOME with swap | Completed installation on physical hardware |
+
+Package resolution was verified for all network profiles. Separate desktop boot
+tests for Xfce, LXQt, and the network Plasma profile are pending.
+
+## Upstream image-building tools
 
 ## Overview
 
